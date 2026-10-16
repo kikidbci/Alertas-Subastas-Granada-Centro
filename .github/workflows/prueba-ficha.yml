@@ -1,0 +1,66 @@
+name: Prueba ficha BOE
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  leer-ficha:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Instalar dependencias
+        run: python -m pip install requests beautifulsoup4
+
+      - name: Leer valor y ubicacion
+        shell: python
+        run: |
+          import unicodedata
+          import requests
+          from bs4 import BeautifulSoup
+
+          def normalizar(texto):
+              texto = unicodedata.normalize("NFKD", texto)
+              return "".join(
+                  c for c in texto if not unicodedata.combining(c)
+              ).lower().strip().rstrip(":")
+
+          base = "https://subastas.boe.es/detalleSubasta.php"
+          referencia = "SUB-JA-2026-266805"
+          session = requests.Session()
+          session.headers["User-Agent"] = "AlertasSubastasGranada/0.1"
+
+          consultas = [
+              ("Informacion general", {"idSub": referencia}),
+              ("Bienes", {"idSub": referencia, "ver": "3"}),
+          ]
+          campos = {
+              "valor subasta", "lotes", "direccion",
+              "codigo postal", "localidad", "provincia"
+          }
+          encontrados = set()
+
+          for titulo, parametros in consultas:
+              respuesta = session.get(
+                  base, params=parametros, timeout=45
+              )
+              respuesta.raise_for_status()
+              pagina = BeautifulSoup(respuesta.content, "html.parser")
+              print(f"\n--- {titulo}: {referencia} ---")
+
+              for fila in pagina.select("tr"):
+                  celdas = fila.find_all(["th", "td"], recursive=False)
+                  if len(celdas) < 2:
+                      continue
+                  etiqueta = celdas[0].get_text(" ", strip=True)
+                  clave = normalizar(etiqueta)
+                  if clave in campos:
+                      valor = celdas[1].get_text(" ", strip=True)
+                      print(f"{etiqueta}: {valor}")
+                      encontrados.add(clave)
+
+          if "valor subasta" not in encontrados:
+              raise RuntimeError("No se ha podido leer el valor de subasta.")
+          if "localidad" not in encontrados:
+              raise RuntimeError("No se ha podido leer la localidad.")
