@@ -1,0 +1,24 @@
+name: Mantener alertas activas
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  actions: write
+
+jobs:
+  mantener:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Reactivar workflows programados
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for wf in alertas-boe.yml mantener-activo.yml; do
+            gh api -X PUT "repos/$REPO/actions/workflows/$wf/enable"
+            echo "Activo: $wf"
+          done
