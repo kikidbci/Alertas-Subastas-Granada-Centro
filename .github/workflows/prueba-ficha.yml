@@ -8,13 +8,14 @@ permissions: {}
 jobs:
   leer-ficha:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 3
+
     steps:
       - name: Instalar dependencias
         run: python -m pip install requests beautifulsoup4
 
       - name: Leer valor y ubicacion
-        shell: python
+        shell: python -u {0}
         run: |
           import unicodedata
           import requests
@@ -22,45 +23,65 @@ jobs:
 
           def normalizar(texto):
               texto = unicodedata.normalize("NFKD", texto)
-              return "".join(
-                  c for c in texto if not unicodedata.combining(c)
-              ).lower().strip().rstrip(":")
+              texto = "".join(
+                  c for c in texto
+                  if not unicodedata.combining(c)
+              )
+              return " ".join(texto.lower().split()).rstrip(":")
 
           base = "https://subastas.boe.es/detalleSubasta.php"
           referencia = "SUB-JA-2026-266805"
+
           session = requests.Session()
           session.headers["User-Agent"] = "AlertasSubastasGranada/0.1"
+          session.max_redirects = 5
 
           consultas = [
               ("Informacion general", {"idSub": referencia}),
               ("Bienes", {"idSub": referencia, "ver": "3"}),
           ]
+
           campos = {
-              "valor subasta", "lotes", "direccion",
-              "codigo postal", "localidad", "provincia"
+              "valor subasta",
+              "lotes",
+              "direccion",
+              "codigo postal",
+              "localidad",
+              "provincia",
           }
           encontrados = set()
 
           for titulo, parametros in consultas:
-              respuesta = session.get(
-                  base, params=parametros, timeout=45
+              print(f"\nConsultando: {titulo}", flush=True)
+
+              try:
+                  respuesta = session.get(
+                      base,
+                      params=parametros,
+                      timeout=(10, 20),
+                  )
+                  print(
+                      f"Respuesta HTTP: {respuesta.status_code}",
+                      flush=True,
+                  )
+                  respuesta.raise_for_status()
+
+              except requests.exceptions.Timeout:
+                  raise SystemExit(
+                      f"ERROR en {titulo}: se ha superado el "
+                      "limite de espera de conexion o de datos. "
+                      "No se ha podido completar esta consulta."
+                  )
+
+              except requests.exceptions.RequestException as error:
+                  raise SystemExit(
+                      f"ERROR en {titulo}: {error}"
+                  )
+
+              pagina = BeautifulSoup(
+                  respuesta.content, "html.parser"
               )
-              respuesta.raise_for_status()
-              pagina = BeautifulSoup(respuesta.content, "html.parser")
-              print(f"\n--- {titulo}: {referencia} ---")
+              print(f"--- {titulo}: {referencia} ---", flush=True)
 
               for fila in pagina.select("tr"):
-                  celdas = fila.find_all(["th", "td"], recursive=False)
-                  if len(celdas) < 2:
-                      continue
-                  etiqueta = celdas[0].get_text(" ", strip=True)
-                  clave = normalizar(etiqueta)
-                  if clave in campos:
-                      valor = celdas[1].get_text(" ", strip=True)
-                      print(f"{etiqueta}: {valor}")
-                      encontrados.add(clave)
-
-          if "valor subasta" not in encontrados:
-              raise RuntimeError("No se ha podido leer el valor de subasta.")
-          if "localidad" not in encontrados:
-              raise RuntimeError("No se ha podido leer la localidad.")
+                  celdas = fila
