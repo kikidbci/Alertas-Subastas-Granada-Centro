@@ -1,0 +1,310 @@
+name: Alertas BOE Granada
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "2-57/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alertas-boe-granada
+  cancel-in-progress: false
+
+jobs:
+  vigilar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar dependencias
+        run: python -m pip install requests beautifulsoup4
+
+      - name: Buscar novedades y enviar avisos
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        shell: python -u {0}
+        run: |
+          import json
+          import os
+          import re
+          import time
+          import unicodedata
+          from decimal import Decimal
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, parse_qs
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          BASE = "https://subastas.boe.es/"
+          BUSCAR = urljoin(BASE, "subastas_ava.php")
+          DETALLE = urljoin(BASE, "detalleSubasta.php")
+          ARCHIVO = Path("subastas-vistas.json")
+          LIMITE = Decimal("200000")
+          TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+
+          if not re.fullmatch(r"[A-Za-z0-9_-]+", TOPIC):
+              raise SystemExit(
+                  "NTFY_TOPIC debe contener solo letras, numeros, "
+                  "guiones o guiones bajos, sin URL ni espacios."
+              )
+
+          session = requests.Session()
+          session.headers["User-Agent"] = "AlertasSubastasGranada/1.0"
+          session.max_redirects = 5
+
+          def obtener(url, datos=None):
+              time.sleep(1)
+              if datos is None:
+                  r = session.get(url, timeout=(10, 25))
+              else:
+                  r = session.post(url, data=datos, timeout=(10, 25))
+              r.raise_for_status()
+              return r, BeautifulSoup(r.content, "html.parser")
+
+          def normalizar(texto):
+              texto = unicodedata.normalize("NFKD", texto)
+              texto = "".join(
+                  c for c in texto if not unicodedata.combining(c)
+              )
+              return " ".join(texto.lower().split()).rstrip(":")
+
+          def notificar(titulo, mensaje, enlace=None):
+              headers = {"Title": titulo}
+              if enlace:
+                  headers["Click"] = enlace
+              r = requests.post(
+                  "https://ntfy.sh/" + TOPIC,
+                  data=mensaje.encode("utf-8"),
+                  headers=headers,
+                  timeout=(10, 25),
+              )
+              r.raise_for_status()
+
+          def guardar(vistas):
+              temporal = ARCHIVO.with_suffix(".tmp")
+              temporal.write_text(
+                  json.dumps(sorted(vistas), indent=2),
+                  encoding="utf-8",
+              )
+              temporal.replace(ARCHIVO)
+
+          def campos(pagina):
+              resultado = {}
+              for fila in pagina.select("tr"):
+                  celdas = fila.find_all(
+                      ["th", "td"], recursive=False
+                  )
+                  if len(celdas) >= 2:
+                      clave = normalizar(
+                          celdas[0].get_text(" ", strip=True)
+                      )
+                      valor = celdas[1].get_text(" ", strip=True)
+                      resultado.setdefault(clave, []).append(valor)
+              return resultado
+
+          def buscar(estado):
+              _, pagina = obtener(BUSCAR)
+              formulario = pagina.find(
+                  "form", action="subastas_ava.php"
+              )
+              if formulario is None:
+                  raise RuntimeError("No se reconoce el formulario BOE.")
+
+              datos = {}
+              for elemento in formulario.select("input[name], select[name]"):
+                  nombre = elemento["name"]
+                  if elemento.name == "select":
+                      opcion = elemento.find("option", selected=True)
+                      if opcion is None:
+                          opcion = elemento.find("option")
+                      datos[nombre] = (
+                          opcion.get("value", "") if opcion else ""
+                      )
+                  else:
+                      tipo = elemento.get("type", "text")
+                      if tipo in ("submit", "button"):
+                          continue
+                      if tipo in ("radio", "checkbox"):
+                          if not elemento.has_attr("checked"):
+                              continue
+                      datos[nombre] = elemento.get("value", "")
+
+              datos.update({
+                  "dato[0]": "",
+                  "dato[2]": estado,
+                  "dato[3]": "I",
+                  "dato[4]": "501",
+                  "dato[7]": "Granada",
+                  "dato[8]": "18",
+                  "page_hits": "50",
+                  "accion": "Buscar",
+              })
+
+              respuesta, pagina = obtener(BUSCAR, datos)
+              pendientes = [(respuesta.url, pagina)]
+              recorridas = set()
+              referencias = set()
+
+              while pendientes:
+                  url, pagina = pendientes.pop(0)
+                  if url in recorridas:
+                      continue
+                  recorridas.add(url)
+                  if len(recorridas) > 30:
+                      raise RuntimeError(
+                          "Demasiadas paginas: revisar paginacion."
+                      )
+
+                  ids = set(re.findall(
+                      r"SUB-[A-Z]+-\d{4}-\d+", str(pagina)
+                  ))
+                  texto = normalizar(
+                      pagina.get_text(" ", strip=True)
+                  )
+                  if not ids and "no se han encontrado documentos" not in texto:
+                      raise RuntimeError(
+                          "Respuesta de busqueda no reconocida."
+                      )
+                  referencias.update(ids)
+
+                  for enlace in pagina.select("a[href]"):
+                      destino = urljoin(url, enlace["href"])
+                      partes = urlparse(destino)
+                      parametros = parse_qs(partes.query)
+                      if (
+                          partes.netloc == urlparse(BASE).netloc
+                          and partes.path.endswith("subastas_ava.php")
+                          and "numPagBus" in parametros
+                          and "idBus" in parametros
+                          and destino not in recorridas
+                          and not any(p[0] == destino for p in pendientes)
+                      ):
+                          r, siguiente = obtener(destino)
+                          pendientes.append((r.url, siguiente))
+
+              return referencias
+
+          primera = not ARCHIVO.exists()
+          vistas = (
+              set() if primera
+              else set(json.loads(ARCHIVO.read_text(encoding="utf-8")))
+          )
+
+          print("Consultando viviendas en Granada...", flush=True)
+          actuales = buscar("PU") | buscar("EJ")
+          print(f"Referencias encontradas: {len(actuales)}", flush=True)
+
+          if primera:
+              notificar(
+                  "Vigilancia BOE iniciada",
+                  "Se ha completado la primera consulta. "
+                  "Las viviendas existentes quedan registradas sin "
+                  "avisos individuales. Se notificaran las nuevas "
+                  "coincidencias detectadas. Zona exacta del mapa "
+                  "pendiente: por ahora se consulta Granada capital.",
+              )
+              guardar(actuales)
+              print("Registro inicial creado. No se avisa del historico.")
+          else:
+              errores = []
+              try:
+                  for referencia in sorted(actuales - vistas):
+                      print(f"Revisando {referencia}", flush=True)
+                      try:
+                          enlace = DETALLE + "?idSub=" + referencia
+                          _, general = obtener(enlace)
+                          info = campos(general)
+
+                          lotes = info.get("lotes", [""])[0]
+                          if normalizar(lotes) != "sin lotes":
+                              notificar(
+                                  "BOE: nueva vivienda para revisar",
+                                  f"{referencia}\n"
+                                  "Subasta con lotes o estructura no reconocida. "
+                                  "No se ha confirmado el limite de 200.000 EUR "
+                                  "ni la zona del mapa.",
+                                  enlace,
+                              )
+                              vistas.add(referencia)
+                              continue
+
+                          valores = info.get("valor subasta", [])
+                          if len(valores) != 1:
+                              raise RuntimeError(
+                                  "No se reconoce un valor de subasta unico."
+                              )
+                          numero = re.sub(
+                              r"[^\d,.-]", "", valores[0]
+                          ).replace(".", "").replace(",", ".")
+                          importe = Decimal(numero)
+
+                          if importe >= LIMITE:
+                              vistas.add(referencia)
+                              continue
+
+                          _, bienes = obtener(enlace + "&ver=3")
+                          ubicacion = campos(bienes)
+                          localidades = ubicacion.get("localidad", [])
+                          direcciones = ubicacion.get("direccion", [])
+
+                          if not localidades or not direcciones:
+                              raise RuntimeError(
+                                  "No se puede confirmar direccion y localidad."
+                              )
+                          if any(
+                              normalizar(x) != "granada"
+                              for x in localidades
+                          ):
+                              raise RuntimeError(
+                                  "Ubicacion ambigua o fuera de Granada capital."
+                              )
+
+                          direccion = " / ".join(dict.fromkeys(direcciones))
+                          notificar(
+                              "BOE: nueva vivienda en Granada",
+                              f"{referencia}\n"
+                              f"Valor de subasta: {valores[0]}\n"
+                              f"Direccion: {direccion}\n"
+                              "Inferior a 200.000 EUR. "
+                              "Zona exacta del mapa pendiente de verificar. "
+                              "El valor de subasta no es el precio final.",
+                              enlace,
+                          )
+                          vistas.add(referencia)
+                          print("Aviso enviado.", flush=True)
+
+                      except Exception as error:
+                          errores.append(referencia)
+                          print(
+                              f"ERROR {referencia}: {error}. "
+                              "Se reintentara en otra ejecucion.",
+                              flush=True,
+                          )
+              finally:
+                  guardar(vistas)
+
+              if errores:
+                  raise SystemExit(
+                      "Consulta incompleta. Revisar errores anteriores."
+                  )
+              print("Revision terminada correctamente.", flush=True)
+
+      - name: Guardar registro para la siguiente revision
+        if: always()
+        shell: bash
+        run: |
+          if [ -f subastas-vistas.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add subastas-vistas.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Actualizar registro de subastas"
+              git push origin HEAD:main
+            fi
+          fi
