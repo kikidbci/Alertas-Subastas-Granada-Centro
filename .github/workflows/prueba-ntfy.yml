@@ -1,0 +1,26 @@
+name: Prueba ntfy
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  enviar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Enviar notificacion de prueba
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then
+            echo "Falta el secreto NTFY_TOPIC"
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            --max-time 30 \
+            --output /dev/null \
+            -H "Title: Prueba de alertas BOE" \
+            -d "La conexion entre GitHub y ntfy funciona. Esto es solo una prueba, no una subasta." \
+            "https://ntfy.sh/${NTFY_TOPIC}"
